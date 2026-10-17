@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import tarfile
 import time
@@ -134,6 +135,36 @@ def main():
         results.append({"index": index, "source": name, "exit_code": code})
     save("simulation-results.json", results)
     assert all(x["exit_code"] == 0 for x in results), results
+    # Keep every compiled object unchanged and move only the shape object to
+    # the front of the linker inputs. This controls its placement in .text.
+    controls = {}
+    for name in ["base", "head"]:
+        build = WORK / ("build-" + name)
+        run(name + "-link-commands", ["ninja", "-C", build, "-t", "commands",
+                                      "benchmark_xtensor"])
+        command = (OUT / (name + "-link-commands.log")).read_text().splitlines()[-1]
+        tokens = shlex.split(command)
+        assert tokens[:2] == [":", "&&"] and tokens[-2:] == ["&&", ":"], tokens
+        tokens = tokens[2:-2]
+        shape = "benchmark/CMakeFiles/benchmark_xtensor.dir/benchmark_xshape.cpp.o"
+        assert tokens.count(shape) == 1
+        tokens.remove(shape)
+        first_object = next(i for i, value in enumerate(tokens) if value.endswith(".o"))
+        tokens.insert(first_object, shape)
+        control = build / "benchmark/benchmark_shape_first"
+        assert tokens[tokens.index("-o") + 1] == "benchmark/benchmark_xtensor"
+        tokens[tokens.index("-o") + 1] = str(control)
+        run(name + "-link-shape-first", tokens, cwd=build)
+        run(name + "-control-symbols", ["nm", "-CS", control])
+        profile = OUT / ("profile-control-" + name)
+        profile.mkdir()
+        controls[name] = run(name + "-simulation-shape-first", [
+            runner, "run", "--mode", "simulation", "--skip-upload",
+            "--profile-folder", profile, "--show-full-output", "--",
+            f"{control} --benchmark_filter=xshape_access",
+        ], check=False)
+    save("simulation-control-results.json", controls)
+    assert all(code == 0 for code in controls.values()), controls
 
 
 if __name__ == "__main__":
